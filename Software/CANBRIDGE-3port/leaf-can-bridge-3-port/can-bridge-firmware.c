@@ -15,6 +15,8 @@ volatile uint8_t My_Leaf  = 1;			// Startup in AZE0 mode, switches to ZE0 if it 
 #define MINPERCENTAGE 50 //Adjust this value to tune what realSOC% will display as 0% on the dash
 #define MAXPERCENTAGE 950 //Adjust this value to tune what realSOC% will display as 100% on the dash
 
+#define DISABLE_REGEN_IN_DRIVE
+
 #define DISABLE_CAN3				//if CAN3 is not connected, enable this
 
 // Charge timer minutes lookup values
@@ -79,6 +81,17 @@ volatile	uint16_t	startup_counter_1DB		= 0;
 volatile 	uint8_t		startup_counter_39X 	= 0;
 //timer variables
 volatile	uint16_t	sec_timer			= 1;	//actually the same as ms_timer but counts down from 1000
+
+#ifdef DISABLE_REGEN_IN_DRIVE
+
+#define FADE_OUT_CAP_AFTER_SETTING_REGEN 20
+static volatile uint8_t current_11A_shifter_state = 0;
+static volatile uint8_t previous_11A_shifter_state = 0;
+static volatile uint8_t disable_regen_toggle = 0;
+static volatile uint8_t eco_active = 0;
+static volatile uint8_t timeToSetCapacityDisplay = 0;
+static volatile uint8_t SetCapacityDisplay = 0;
+#endif /* DISABLE_REGEN_IN_DRIVE */
 
 //bits															10					10					4				8				7			1				3	(2 space)		1					5						13
 volatile	Leaf_2011_5BC_message swap_5bc_remaining	= {.LB_CAPR = 0x12C, .LB_FULLCAP = 0x32, .LB_CAPSEG = 0, .LB_AVET = 50, .LB_SOH = 99, .LB_CAPSW = 0, .LB_RLIMIT = 0, .LB_CAPBALCOMP = 1, .LB_RCHGTCON = 0b01001, .LB_RCHGTIM = 0};
@@ -207,6 +220,12 @@ void reset_state(){
 	charging_state = 0; //Reset charging state 
 	startup_counter_1DB = 0;
 	startup_counter_39X = 0;
+
+#ifdef DISABLE_REGEN_IN_DRIVE
+    current_11A_shifter_state = 0;
+	previous_11A_shifter_state = 0;
+	disable_regen_toggle = 0;
+#endif  /* DISABLE_REGEN_IN_DRIVE */
 }
 
 int main(void){
@@ -416,6 +435,21 @@ void can_handler(uint8_t can_bus){
 					My_Leaf = MY_LEAF_2011;
 				}
 			break;
+#ifdef DISABLE_REGEN_IN_DRIVE
+			case 0x1DC:
+				// This section is used for enabling glide in drive
+				if (disable_regen_toggle && (current_11A_shifter_state == SHIFT_D))
+				{
+					if (!eco_active)
+					{
+						frame.data[1] = (frame.data[1] & 0xC0); // Zero out regen in D
+						frame.data[2] = (frame.data[2] & 0x0F);
+					}
+				}
+
+				calc_crc8(&frame);
+			break;
+#endif  /* DISABLE_REGEN_IN_DRIVE */
 			case 0x50B:
 
 				VCM_WakeUpSleepCommand = (frame.data[3] & 0xC0) >> 6;
@@ -732,7 +766,27 @@ void can_handler(uint8_t can_bus){
 				
 				}
 
-				
+#ifdef DISABLE_REGEN_IN_DRIVE
+                uint8_t mux_5bc_CapacityCharge = frame.data[4] & 0x01;
+
+	            if (timeToSetCapacityDisplay > 0)
+	            {
+				    timeToSetCapacityDisplay--;
+		            if (mux_5bc_CapacityCharge == 1)
+		            {
+			            if( My_Leaf == MY_LEAF_2011 )
+			            {
+				            // 2011 works a bit differently when it comes to visualizing battery saver
+				            frame.data[2] = (uint8_t)((frame.data[2] & 0xF0) | SetCapacityDisplay);
+			            }
+			            if( My_Leaf == MY_LEAF_2014 )
+			            {
+				            frame.data[2] = (uint8_t)((frame.data[2] & 0x0F) | SetCapacityDisplay << 4);
+			            }
+		            }
+	            }
+#endif
+
 				break;
 			case 0x5C0: //Send 500ms messages here
 				send_can(battery_can_bus, ZE1_5EC_message);//500ms
@@ -759,6 +813,37 @@ void can_handler(uint8_t can_bus){
 				//It also eliminates the need for an if statement and a conditional check, which improves performance (but sacrifices readability)
 
 				break;
+
+#ifdef DISABLE_REGEN_IN_DRIVE
+	       case 0x11A:
+		       current_11A_shifter_state = (frame.data[0] & 0xF0);
+
+		       eco_active = ((frame.data[1] & 0x10) >> 4);
+
+		       if (previous_11A_shifter_state == SHIFT_D)
+		       {
+			       // If we go from D to N, toggle the regen disable feature
+			       if (current_11A_shifter_state == SHIFT_N)
+			       {
+				       if (disable_regen_toggle == 0)
+				       {
+					       disable_regen_toggle = 1;
+					       timeToSetCapacityDisplay = FADE_OUT_CAP_AFTER_SETTING_REGEN;
+					       SetCapacityDisplay = 2;
+				       }
+				       else
+				       {
+					       disable_regen_toggle = 0;
+					       timeToSetCapacityDisplay = FADE_OUT_CAP_AFTER_SETTING_REGEN;
+					       SetCapacityDisplay = 4;
+				       }
+			       }
+		       }
+
+		       previous_11A_shifter_state = (frame.data[0] & 0xF0);
+			   break;
+#endif  /* DISABLE_REGEN_IN_DRIVE */
+
 			case 0x1F2:
  				//Collect charging state
 				charging_state = frame.data[2];
