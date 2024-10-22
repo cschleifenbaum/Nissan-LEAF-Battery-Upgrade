@@ -21,6 +21,18 @@ volatile uint8_t My_Leaf  = 1;			// Startup in AZE0 mode, switches to ZE0 if it 
 #define MINPERCENTAGE 50 //Adjust this value to tune what realSOC% will display as 0% on the dash
 #define MAXPERCENTAGE 950 //Adjust this value to tune what realSOC% will display as 100% on the dash
 
+#define DISABLE_REGEN_IN_DRIVE
+
+#ifdef DISABLE_REGEN_IN_DRIVE
+#define FADE_OUT_CAP_AFTER_SETTING_REGEN 20
+static volatile uint8_t current_11A_shifter_state = 0;
+static volatile uint8_t previous_11A_shifter_state = 0;
+static volatile uint8_t disable_regen_toggle = 0;
+static volatile uint8_t eco_active = 0;
+static volatile uint8_t timeToSetCapacityDisplay = 0;
+static volatile uint8_t SetCapacityDisplay = 0;
+#endif /* DISABLE_REGEN_IN_DRIVE */
+
 typedef enum
 {
     TIME_100_WITH_200V_IN_MINUTES,
@@ -135,6 +147,12 @@ void reset_state(void)
 	charging_state = 0; //Reset charging state 
 	startup_counter_1DB = 0;
 	startup_counter_39X = 0;
+	
+#ifdef DISABLE_REGEN_IN_DRIVE
+  current_11A_shifter_state = 0;
+	previous_11A_shifter_state = 0;
+	disable_regen_toggle = 0;
+#endif  /* DISABLE_REGEN_IN_DRIVE */
 }
 
 void convert_5bc_to_array(Leaf_2011_5BC_message * src, uint8_t * dest)
@@ -335,7 +353,21 @@ void can_handler(uint8_t can_bus, CAN_FRAME *frame)
 						My_Leaf = MY_LEAF_2011;
 					}
 				break;
-        case 0x50B:
+#ifdef DISABLE_REGEN_IN_DRIVE
+			  case 0x1DC:
+				  // This section is used for enabling glide in drive
+				  if (disable_regen_toggle && (current_11A_shifter_state == SHIFT_D))
+				  {
+					  if (!eco_active)
+					  {
+						  frame->data[1] = (frame->data[1] & 0xC0); // Zero out regen in D
+						  frame->data[2] = (frame->data[2] & 0x0F);
+					  }
+				  }
+				  calc_crc8(frame);
+			  break;
+#endif  /* DISABLE_REGEN_IN_DRIVE */
+				case 0x50B:
 
             VCM_WakeUpSleepCommand = (frame->data[3] & 0xC0) >> 6;
 						Byte2_50B = frame->data[2];
@@ -730,6 +762,26 @@ void can_handler(uint8_t can_bus, CAN_FRAME *frame)
                 }
             }
             
+#ifdef DISABLE_REGEN_IN_DRIVE
+            uint8_t mux_5bc_CapacityCharge = frame->data[4] & 0x01;
+            if (timeToSetCapacityDisplay > 0)
+            {
+                timeToSetCapacityDisplay--;
+		            if (mux_5bc_CapacityCharge == 1)
+		            {
+			            if( My_Leaf == MY_LEAF_2011 )
+			            {
+				            // 2011 works a bit differently when it comes to visualizing battery saver
+				            frame->data[2] = (uint8_t)((frame->data[2] & 0xF0) | SetCapacityDisplay);
+			            }
+			            if( My_Leaf == MY_LEAF_2014 )
+			            {
+				            frame->data[2] = (uint8_t)((frame->data[2] & 0x0F) | SetCapacityDisplay << 4);
+			            }
+		            }
+	          }
+#endif
+						
             break;
         case 0x5C0: // Send 500ms messages here
 
@@ -761,7 +813,35 @@ void can_handler(uint8_t can_bus, CAN_FRAME *frame)
 						//It also eliminates the need for an if statement and a conditional check, which improves performance (but sacrifices readability)
             
             break;
-        case 0x1F2: //Message from VCM
+						
+#ifdef DISABLE_REGEN_IN_DRIVE
+	        case 0x11A:
+		        current_11A_shifter_state = (frame->data[0] & 0xF0);
+		        eco_active = ((frame->data[1] & 0x10) >> 4);
+		        if (previous_11A_shifter_state == SHIFT_D)
+		        {
+			        // If we go from D to N, toggle the regen disable feature
+			        if (current_11A_shifter_state == SHIFT_N)
+			        {
+				        if (disable_regen_toggle == 0)
+				        {
+					        disable_regen_toggle = 1;
+					        timeToSetCapacityDisplay = FADE_OUT_CAP_AFTER_SETTING_REGEN;
+					        SetCapacityDisplay = 2;
+				        }
+				        else
+				        {
+					        disable_regen_toggle = 0;
+					        timeToSetCapacityDisplay = FADE_OUT_CAP_AFTER_SETTING_REGEN;
+					        SetCapacityDisplay = 4;
+				        }
+			        }
+		        }
+		        previous_11A_shifter_state = (frame->data[0] & 0xF0);
+			      break;
+#endif  /* DISABLE_REGEN_IN_DRIVE */
+			
+      case 0x1F2: //Message from VCM
 			//Collect charging state
 			charging_state = frame->data[2];
 			//Check if VCM wants to only charge to 80%
